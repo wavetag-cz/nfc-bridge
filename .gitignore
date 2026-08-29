@@ -1,0 +1,5 @@
+node_modules/
+bridge.log
+start-hidden.vbs
+.DS_Store
+.env
