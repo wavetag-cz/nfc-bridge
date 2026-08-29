@@ -14,7 +14,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
+          # Not windows-latest: it ships Visual Studio 2026 (version 18),
+          # which node-gyp 11.x cannot detect. VS 2022 works.
+          - os: windows-2022
             asset: pcsclite-win32-x64.node
     runs-on: ${{ matrix.os }}
     steps:
