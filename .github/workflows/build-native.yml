@@ -1,0 +1,59 @@
+name: Build native module
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset: pcsclite-win32-x64.node
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Compiles @pokusew/pcsclite from source. The runner already has MSVC,
+      # which is the whole point: operators never need it.
+      - run: npm ci
+
+      - name: Collect the built binary
+        shell: bash
+        run: cp node_modules/@pokusew/pcsclite/build/Release/pcsclite.node "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      # The install scripts fetch these through the /releases/latest/download/
+      # URL, so a release must exist even for a manual run.
+      - name: Publish to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            tag="native-${GITHUB_RUN_NUMBER}"
+          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes "Prebuilt pcsclite for Node 22." || true
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*.node
