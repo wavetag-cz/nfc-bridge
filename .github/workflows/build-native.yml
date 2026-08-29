@@ -17,7 +17,13 @@ jobs:
           # Not windows-latest: it ships Visual Studio 2026 (version 18),
           # which node-gyp 11.x cannot detect. VS 2022 works.
           - os: windows-2022
+            node-arch: x64
             asset: pcsclite-win32-x64.node
+          # Some operators run 32bit Windows. A x64 binary cannot be loaded
+          # into a 32bit process, so build against a 32bit Node as well.
+          - os: windows-2022
+            node-arch: x86
+            asset: pcsclite-win32-ia32.node
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +31,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          architecture: ${{ matrix.node-arch }}
 
       # Compiles @pokusew/pcsclite from source. The runner already has MSVC,
       # which is the whole point: operators never need it.
