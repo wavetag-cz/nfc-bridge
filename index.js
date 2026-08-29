@@ -291,7 +291,10 @@ wss.on("connection", (ws) => {
 const nfc = new NFC();
 
 nfc.on("reader", (reader) => {
-  if (/sam/i.test(reader.name)) {
+  // Only the contactless side of the ACR1252. Laptops often expose a built in
+  // smart card slot and a SIM reader as well, and those would otherwise
+  // overwrite currentReader and report cards the bridge cannot process.
+  if (!/acr1252/i.test(reader.name) || /sam/i.test(reader.name)) {
     console.log("Ignoring reader:", reader.name);
     return;
   }
