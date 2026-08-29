@@ -78,33 +78,124 @@ const buildNdefUrl = (url) => {
   return data;
 };
 
-const parseNdefUrl = (data) => {
+// Walks the TLV blocks on the tag and returns the body of the NDEF one. Tags
+// written by phone apps often carry a lock or memory control block first, and
+// a message over 254 bytes uses the three byte length form.
+const findNdefMessage = (data) => {
   let i = 0;
 
-  while (i < data.length && data[i] === 0x00) {
-    i++;
+  while (i + 1 < data.length) {
+    const tag = data[i];
+
+    if (tag === 0x00) {
+      i++;
+      continue;
+    }
+
+    if (tag === 0xfe) {
+      return null;
+    }
+
+    let len = data[i + 1];
+    let header = 2;
+
+    if (len === 0xff) {
+      if (i + 3 >= data.length) {
+        return null;
+      }
+
+      len = data.readUInt16BE(i + 2);
+      header = 4;
+    }
+
+    if (i + header + len > data.length) {
+      return null;
+    }
+
+    if (tag === 0x03) {
+      return data.slice(i + header, i + header + len);
+    }
+
+    i += header + len;
   }
 
-  if (i >= data.length || data[i] !== 0x03) {
-    return null;
+  return null;
+};
+
+// Returns the first URI record in the message. Anything else in there (a text
+// record, an Android application record) is skipped rather than rejected.
+const findUriRecord = (message) => {
+  let i = 0;
+
+  while (i < message.length) {
+    const header = message[i];
+    const tnf = header & 0x07;
+    const shortRecord = (header & 0x10) !== 0;
+    const hasId = (header & 0x08) !== 0;
+    let p = i + 1;
+
+    if (p >= message.length) {
+      return null;
+    }
+
+    const typeLen = message[p];
+    p += 1;
+
+    let payloadLen;
+
+    if (shortRecord) {
+      if (p >= message.length) {
+        return null;
+      }
+
+      payloadLen = message[p];
+      p += 1;
+    } else {
+      if (p + 4 > message.length) {
+        return null;
+      }
+
+      payloadLen = message.readUInt32BE(p);
+      p += 4;
+    }
+
+    const idLen = hasId ? message[p++] : 0;
+    const type = message.slice(p, p + typeLen);
+    p += typeLen + idLen;
+
+    const payload = message.slice(p, p + payloadLen);
+    p += payloadLen;
+
+    if (p > message.length) {
+      return null;
+    }
+
+    // TNF 1 is an NFC Forum well known type, "U" is the URI record.
+    if (tnf === 0x01 && type.toString("ascii") === "U" && payload.length) {
+      const prefix = URI_PREFIXES[payload[0]];
+
+      if (prefix === undefined) {
+        return null;
+      }
+
+      return prefix + payload.slice(1).toString("utf8");
+    }
+
+    // Message End flag: nothing follows this record.
+    if ((header & 0x40) !== 0) {
+      return null;
+    }
+
+    i = p;
   }
 
-  const len = data[i + 1];
-  const record = data.slice(i + 2, i + 2 + len);
+  return null;
+};
 
-  if (record[0] !== 0xd1 || record[3] !== 0x55) {
-    return null;
-  }
+const parseNdefUrl = (data) => {
+  const message = findNdefMessage(data);
 
-  const payloadLen = record[2];
-  const payload = record.slice(4, 4 + payloadLen);
-  const prefix = URI_PREFIXES[payload[0]];
-
-  if (prefix === undefined) {
-    return null;
-  }
-
-  return prefix + payload.slice(1).toString("utf8");
+  return message ? findUriRecord(message) : null;
 };
 
 const writeUrl = async (url) => {
@@ -217,6 +308,7 @@ const readUrl = async () => {
     const url = parseNdefUrl(data);
 
     if (!url) {
+      console.error("No URL on tag, first bytes:", data.slice(0, 48).toString("hex"));
       return { error: "nfc-no-ndef" };
     }
 
