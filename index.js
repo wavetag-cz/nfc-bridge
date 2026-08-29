@@ -296,6 +296,9 @@ nfc.on("reader", (reader) => {
   // overwrite currentReader and report cards the bridge cannot process.
   if (!/acr1252/i.test(reader.name) || /sam/i.test(reader.name)) {
     console.log("Ignoring reader:", reader.name);
+    // An emitter with no error listener throws, and these readers do emit
+    // errors for whatever they hold, such as an inserted SIM card.
+    reader.on("error", () => {});
     return;
   }
 
