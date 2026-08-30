@@ -1,6 +1,8 @@
 import { WebSocketServer } from "ws";
 import { NFC } from "nfc-pcsc";
 
+import { log, logPath } from "./logger.js";
+
 const PORT = 7788;
 const ALLOWED_ORIGINS = ["https://admin.wavetag.cz", "http://localhost:5173"];
 const CHIPS = {
@@ -16,31 +18,12 @@ const URI_PREFIXES = {
   0x04: "https://",
 };
 
+let nfc = null;
 let currentReader = null;
 let currentCard = null;
 let busy = false;
-
-const wss = new WebSocketServer({
-  host: "127.0.0.1",
-  port: PORT,
-  verifyClient: (info) => ALLOWED_ORIGINS.includes(info.origin),
-});
-
-const status = () => {
-  return JSON.stringify({
-    type: "status",
-    reader: currentReader ? currentReader.name : null,
-    card: currentCard,
-  });
-};
-
-const broadcastStatus = () => {
-  for (const client of wss.clients) {
-    if (client.readyState === 1) {
-      client.send(status());
-    }
-  }
-};
+let readerMissingSince = Date.now();
+let retryDelay = 15000;
 
 const buildNdefUrl = (url) => {
   let prefix = 0x00;
@@ -59,7 +42,7 @@ const buildNdefUrl = (url) => {
     Buffer.from(rest, "utf8"),
   ]);
 
-  if (payload.length > 255 || payload.length + 4 > 255) {
+  if (payload.length + 4 > 255) {
     return null;
   }
 
@@ -73,14 +56,12 @@ const buildNdefUrl = (url) => {
     Buffer.from([0xfe]),
   ]);
   const data = Buffer.alloc(Math.ceil(tlv.length / 4) * 4);
+
   tlv.copy(data);
 
   return data;
 };
 
-// Walks the TLV blocks on the tag and returns the body of the NDEF one. Tags
-// written by phone apps often carry a lock or memory control block first, and
-// a message over 254 bytes uses the three byte length form.
 const findNdefMessage = (data) => {
   let i = 0;
 
@@ -122,8 +103,6 @@ const findNdefMessage = (data) => {
   return null;
 };
 
-// Returns the first URI record in the message. Anything else in there (a text
-// record, an Android application record) is skipped rather than rejected.
 const findUriRecord = (message) => {
   let i = 0;
 
@@ -170,18 +149,14 @@ const findUriRecord = (message) => {
       return null;
     }
 
-    // TNF 1 is an NFC Forum well known type, "U" is the URI record.
     if (tnf === 0x01 && type.toString("ascii") === "U" && payload.length) {
       const prefix = URI_PREFIXES[payload[0]];
 
-      if (prefix === undefined) {
-        return null;
-      }
-
-      return prefix + payload.slice(1).toString("utf8");
+      return prefix === undefined
+        ? null
+        : prefix + payload.slice(1).toString("utf8");
     }
 
-    // Message End flag: nothing follows this record.
     if ((header & 0x40) !== 0) {
       return null;
     }
@@ -199,66 +174,34 @@ const parseNdefUrl = (data) => {
 };
 
 const writeUrl = async (url) => {
-  if (busy) {
-    return "nfc-busy";
-  }
-
-  if (!currentReader) {
-    return "nfc-no-reader";
-  }
-
-  if (!currentCard || !currentCard.capacity) {
-    return "nfc-no-card";
-  }
-
   const data = buildNdefUrl(url);
 
   if (!data || data.length > currentCard.capacity) {
-    return "nfc-too-long";
+    return { error: "nfc-too-long" };
   }
-
-  busy = true;
 
   try {
-    try {
-      await currentReader.write(4, data, 4);
-    } catch (error) {
-      console.error("Write failed:", error.message);
-      return "nfc-write-failed";
-    }
-
-    try {
-      const written = await currentReader.read(4, data.length, 4);
-
-      if (!written.equals(data)) {
-        return "nfc-verify-failed";
-      }
-    } catch (error) {
-      console.error("Write verification failed:", error.message);
-      return "nfc-verify-failed";
-    }
-
-    return null;
-  } finally {
-    busy = false;
+    await currentReader.write(4, data, 4);
+  } catch (error) {
+    log("Write failed:", error.message);
+    return { error: "nfc-write-failed" };
   }
+
+  try {
+    const written = await currentReader.read(4, data.length, 4);
+
+    if (!written.equals(data)) {
+      return { error: "nfc-verify-failed" };
+    }
+  } catch (error) {
+    log("Write verification failed:", error.message);
+    return { error: "nfc-verify-failed" };
+  }
+
+  return {};
 };
 
 const lockTag = async () => {
-  if (busy) {
-    return "nfc-busy";
-  }
-
-  if (!currentReader) {
-    return "nfc-no-reader";
-  }
-
-  if (!currentCard || !currentCard.capacity) {
-    return "nfc-no-card";
-  }
-
-  busy = true;
-
   try {
     const cc = await currentReader.read(3, 4, 4);
     const locked = Buffer.from([cc[0], cc[1], cc[2], cc[3] | 0x0f]);
@@ -267,20 +210,44 @@ const lockTag = async () => {
 
     const written = await currentReader.read(3, 4, 4);
 
-    if (!written.equals(locked)) {
-      return "nfc-lock-failed";
-    }
-
-    return null;
+    return written.equals(locked) ? {} : { error: "nfc-lock-failed" };
   } catch (error) {
-    console.error("Lock failed:", error.message);
-    return "nfc-lock-failed";
-  } finally {
-    busy = false;
+    log("Lock failed:", error.message);
+    return { error: "nfc-lock-failed" };
   }
 };
 
 const readUrl = async () => {
+  let data;
+
+  try {
+    data = await currentReader.read(4, currentCard.capacity, 4);
+  } catch (error) {
+    log("Read failed:", error.message);
+    return { error: "nfc-read-failed" };
+  }
+
+  const url = parseNdefUrl(data);
+
+  if (!url) {
+    log("No URL on tag, first bytes:", data.slice(0, 48).toString("hex"));
+    return { error: "nfc-no-ndef" };
+  }
+
+  return { url };
+};
+
+const runRequest = async (request) => {
+  const type = request.type;
+
+  if (type !== "writeUrl" && type !== "readUrl" && type !== "lock") {
+    return { error: "nfc-bad-request" };
+  }
+
+  if (type === "writeUrl" && typeof request.url !== "string") {
+    return { error: "nfc-bad-request" };
+  }
+
   if (busy) {
     return { error: "nfc-busy" };
   }
@@ -296,31 +263,57 @@ const readUrl = async () => {
   busy = true;
 
   try {
-    let data;
-
-    try {
-      data = await currentReader.read(4, currentCard.capacity, 4);
-    } catch (error) {
-      console.error("Read failed:", error.message);
-      return { error: "nfc-read-failed" };
+    if (type === "writeUrl") {
+      return await writeUrl(request.url);
     }
 
-    const url = parseNdefUrl(data);
-
-    if (!url) {
-      console.error("No URL on tag, first bytes:", data.slice(0, 48).toString("hex"));
-      return { error: "nfc-no-ndef" };
+    if (type === "lock") {
+      return await lockTag();
     }
 
-    return { url };
+    return await readUrl();
   } finally {
     busy = false;
   }
 };
 
-const sendResult = (ws, id, extra) => {
-  ws.send(JSON.stringify({ type: "result", id: id ?? null, ...extra }));
+const wss = new WebSocketServer({
+  host: "127.0.0.1",
+  port: PORT,
+  verifyClient: (info) => {
+    if (ALLOWED_ORIGINS.includes(info.origin)) {
+      return true;
+    }
+
+    log("Rejected connection from origin:", info.origin);
+    return false;
+  },
+});
+
+const status = () => {
+  return JSON.stringify({
+    type: "status",
+    reader: currentReader ? currentReader.name : null,
+    card: currentCard,
+  });
 };
+
+const broadcastStatus = () => {
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      client.send(status());
+    }
+  }
+};
+
+wss.on("error", (error) => {
+  if (error.code === "EADDRINUSE") {
+    log("Port " + PORT + " is taken, another bridge is already running.");
+    process.exit(1);
+  }
+
+  log("Server error:", error.message);
+});
 
 wss.on("connection", (ws) => {
   ws.send(status());
@@ -331,111 +324,142 @@ wss.on("connection", (ws) => {
     try {
       request = JSON.parse(message);
     } catch {
-      sendResult(ws, null, { ok: false, error: "nfc-bad-request" });
-      return;
+      request = null;
     }
 
-    if (
-      !request ||
-      typeof request !== "object" ||
-      (request.type !== "writeUrl" &&
-        request.type !== "readUrl" &&
-        request.type !== "lock") ||
-      (request.type === "writeUrl" && !request.url)
-    ) {
-      sendResult(
-        ws,
-        request && typeof request === "object" ? request.id : null,
-        {
+    if (!request || typeof request !== "object") {
+      ws.send(
+        JSON.stringify({
+          type: "result",
+          id: null,
           ok: false,
           error: "nfc-bad-request",
-        },
+        }),
       );
       return;
     }
 
-    if (request.type === "writeUrl") {
-      console.log("Writing", request.url);
-      const error = await writeUrl(request.url);
-      sendResult(ws, request.id, { ok: !error, ...(error && { error }) });
-      return;
+    const result = await runRequest(request);
+
+    if (result.error) {
+      log(request.type + " failed:", result.error);
     }
 
-    if (request.type === "lock") {
-      console.log("Locking tag");
-      const error = await lockTag();
-      sendResult(ws, request.id, { ok: !error, ...(error && { error }) });
-      return;
-    }
-
-    console.log("Reading URL from tag");
-    const result = await readUrl();
-    sendResult(
-      ws,
-      request.id,
-      result.error
-        ? { ok: false, error: result.error }
-        : { ok: true, url: result.url },
+    ws.send(
+      JSON.stringify({
+        type: "result",
+        id: request.id ?? null,
+        ok: !result.error,
+        ...result,
+      }),
     );
   });
 });
 
-const nfc = new NFC();
+const forgetReader = (reader) => {
+  if (currentReader === reader) {
+    currentReader = null;
+    currentCard = null;
+    readerMissingSince = Date.now();
+    broadcastStatus();
+  }
+};
 
-nfc.on("reader", (reader) => {
-  // Only the contactless side of the ACR1252. Laptops often expose a built in
-  // smart card slot and a SIM reader as well, and those would otherwise
-  // overwrite currentReader and report cards the bridge cannot process.
-  if (!/acr1252/i.test(reader.name) || /sam/i.test(reader.name)) {
-    console.log("Ignoring reader:", reader.name);
-    // An emitter with no error listener throws, and these readers do emit
-    // errors for whatever they hold, such as an inserted SIM card.
-    reader.on("error", () => {});
+const startNfc = () => {
+  readerMissingSince = Date.now();
+  nfc = new NFC();
+
+  nfc.on("error", (error) => {
+    log("PC/SC error:", error.message);
+  });
+
+  nfc.on("reader", (reader) => {
+    // Laptops expose a built in smart card slot and the reader's own SIM slot
+    // as well, and those would otherwise report cards the bridge cannot handle.
+    if (!/acr1252/i.test(reader.name) || /sam/i.test(reader.name)) {
+      log("Ignoring reader:", reader.name);
+      reader.on("error", () => {});
+      return;
+    }
+
+    log("Reader connected:", reader.name);
+    currentReader = reader;
+    retryDelay = 15000;
+    broadcastStatus();
+
+    reader.on("card", async (card) => {
+      try {
+        const cc = await reader.read(3, 4, 4);
+        currentCard = {
+          uid: card.uid,
+          ...(CHIPS[cc[2]] || { chip: "unknown", capacity: null }),
+        };
+      } catch (error) {
+        log("Failed to read tag:", error.message);
+        currentCard = { uid: card.uid, chip: "unknown", capacity: null };
+      }
+
+      broadcastStatus();
+    });
+
+    reader.on("card.off", () => {
+      currentCard = null;
+      broadcastStatus();
+    });
+
+    reader.on("error", (error) => {
+      log("Reader error:", error.message);
+      forgetReader(reader);
+    });
+
+    reader.on("end", () => {
+      log("Reader disconnected:", reader.name);
+      forgetReader(reader);
+    });
+  });
+};
+
+// pcsclite builds its context once and gives up for good if that fails. On
+// Windows the smart card service starts on demand, so it is often still down
+// when the bridge starts with the computer, which used to leave the bridge
+// running but blind to the reader until someone restarted it by hand. The first
+// retries come quickly for that case, then slow down so an unplugged reader
+// does not mean a restart every minute for the rest of the day.
+const restartNfcIfBlind = () => {
+  if (currentReader || busy || Date.now() - readerMissingSince < retryDelay) {
     return;
   }
 
-  console.log("Reader connected:", reader.name);
-  currentReader = reader;
-  broadcastStatus();
+  log("No reader for " + retryDelay / 1000 + "s, restarting PC/SC");
 
-  reader.on("card", async (card) => {
-    try {
-      const cc = await reader.read(3, 4, 4);
-      const chip = CHIPS[cc[2]] || { chip: "unknown", capacity: null };
-      currentCard = { uid: card.uid, ...chip };
-    } catch (error) {
-      console.error("Failed to read tag:", error.message);
-      currentCard = { uid: card.uid, chip: "unknown", capacity: null };
-    }
-    broadcastStatus();
-  });
+  try {
+    nfc.close();
+  } catch (error) {
+    log("Closing PC/SC failed:", error.message);
+  }
 
-  reader.on("card.off", () => {
-    currentCard = null;
-    broadcastStatus();
-  });
+  nfc.removeAllListeners();
+  currentCard = null;
+  retryDelay = Math.min(retryDelay * 2, 300000);
+  startNfc();
+};
 
-  reader.on("error", (error) => {
-    console.error("Reader error:", error.message);
-    if (currentReader === reader) {
-      currentReader = null;
-      currentCard = null;
-    }
-    broadcastStatus();
-  });
-
-  reader.on("end", () => {
-    console.log("Reader disconnected:", reader.name);
-    if (currentReader === reader) {
-      currentReader = null;
-      currentCard = null;
-    }
-    broadcastStatus();
-  });
+process.on("uncaughtException", (error) => {
+  log("Uncaught exception:", error.stack || error.message);
 });
 
-nfc.on("error", (error) => {
-  console.error("NFC error:", error.message);
+process.on("unhandledRejection", (error) => {
+  log("Unhandled rejection:", error);
 });
 
-console.log("WaveTag NFC bridge running on ws://127.0.0.1:" + PORT);
+log(
+  "WaveTag NFC bridge starting on ws://127.0.0.1:" + PORT,
+  "| node " + process.version,
+  process.platform + "/" + process.arch,
+  "| pid " + process.pid,
+);
+log("Logging to", logPath);
+
+startNfc();
+
+setInterval(restartNfcIfBlind, 5000);

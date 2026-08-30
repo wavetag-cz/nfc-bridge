@@ -1,5 +1,6 @@
 node_modules/
 bridge.log
+bridge.log.old
 start-hidden.vbs
 .DS_Store
 .env

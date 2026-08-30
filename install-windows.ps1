@@ -45,6 +45,28 @@ if ($header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
   exit 1
 }
 
+# The smart card service is demand started on Windows and is regularly still
+# down when the bridge launches from the Startup folder, which used to leave the
+# bridge running but permanently blind to the reader. The bridge now recovers on
+# its own, but starting the service here means it works on the first try.
+try {
+  Set-Service -Name SCardSvr -StartupType Automatic -ErrorAction Stop
+  Start-Service -Name SCardSvr -ErrorAction Stop
+  Write-Host "Smart card service is running."
+} catch {
+  Write-Host "Could not configure the smart card service (run as administrator to fix this)."
+  Write-Host "The bridge will still start it on demand, but the first scan may take longer."
+}
+
+# A second copy cannot bind the port and exits immediately, so clear out any
+# bridge left over from an earlier install before starting this one.
+Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
+  Where-Object { $_.CommandLine -like "*nfc-bridge*index.js*" } |
+  ForEach-Object {
+    Write-Host "Stopping the bridge already running (pid $($_.ProcessId))."
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+
 @"
 Set shell = CreateObject("WScript.Shell")
 shell.Run "node ""$dir\index.js""", 0, False
@@ -54,3 +76,4 @@ Copy-Item $vbs (Join-Path $startup "nfc-bridge.vbs") -Force
 Start-Process wscript $vbs
 
 Write-Host "Done. The bridge is running and will start after login."
+Write-Host "Log file: $(Join-Path $dir 'bridge.log')"
